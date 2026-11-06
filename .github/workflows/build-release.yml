@@ -1,92 +1,153 @@
-name: Build and release
+name: Build all OpenWrt architectures
 
 on:
-  workflow_dispatch:
   push:
-    tags:
-      - 'v*'
+    branches: [main]
+    tags: ['v*']
+    paths: ['Makefile', 'src/**', 'root/**', 'htdocs/**', 'po/**', 'scripts/**', 'tests/**', '.github/workflows/build-release.yml']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      ipk_version:
+        description: 'OpenWrt IPK SDK release'
+        default: '24.10.5'
+        type: string
+      apk_version:
+        description: 'OpenWrt APK SDK release'
+        default: '25.12.4'
+        type: string
+      agent_tag:
+        description: 'Agent tag; empty selects the latest official release'
+        default: ''
+        type: string
+      architectures:
+        description: 'Optional comma-separated package ABIs; empty builds ALL'
+        default: ''
+        type: string
+      publish:
+        description: 'Publish a full build as a GitHub release'
+        default: true
+        type: boolean
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: openwrt-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   prepare:
-    runs-on: ubuntu-latest
+    name: Validate sources and discover supported SDKs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     outputs:
-      agent_tag: ${{ steps.agent.outputs.tag }}
-      agent_hash: ${{ steps.agent.outputs.hash }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      agent_tag: ${{ steps.matrix.outputs.agent_tag }}
+      agent_commit: ${{ steps.agent.outputs.commit }}
+      legacy_source: ${{ steps.matrix.outputs.legacy_source }}
       package_version: ${{ steps.package.outputs.version }}
     steps:
       - uses: actions/checkout@v5
-
-      - name: Check sources
-        run: |
-          set -euo pipefail
-          sh -n root/etc/init.d/nezha-agent
-          sh -n root/etc/uci-defaults/99-nezha-agent
-          sh -n root/usr/libexec/nezha-agent-manager
-          sh -n scripts/build_ipk.sh
-          sh -n scripts/generate_release_notes.sh
-          tests/test_arch_mapping.sh
-          tests/test_manager.sh
-          sh tests/test_uci_defaults.sh
-          sh tests/test_release_notes.sh
-          node tests/test_import_parser.js
-          node --check htdocs/luci-static/resources/view/nezha-agent/config.js
-          node --check htdocs/luci-static/resources/nezha-agent/import-parser.js
-          jq empty root/usr/share/luci/menu.d/luci-app-nezha-agent.json
-          jq empty root/usr/share/rpcd/acl.d/luci-app-nezha-agent.json
-
-      - name: Resolve package version
+      - name: Check sources and regression tests
+        run: bash scripts/check_sources.sh
+      - name: Read package version
         id: package
         run: |
           set -euo pipefail
           version="$(awk -F ':=' '/^PKG_VERSION:=/ { print $2; exit }' Makefile | tr -d '[:space:]')"
-          test -n "$version"
-          if [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" != "v$version" ]]; then
-            echo "Tag $GITHUB_REF_NAME does not match package version v$version" >&2
-            exit 1
-          fi
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
           echo "version=$version" >> "$GITHUB_OUTPUT"
-
-      - name: Resolve latest Nezha Agent
+      - name: Pin the official Agent release and source commit
         id: agent
         env:
           GH_TOKEN: ${{ github.token }}
+          AGENT_TAG: ${{ inputs.agent_tag }}
         run: |
           set -euo pipefail
-          release="$(gh api repos/nezhahq/agent/releases/latest)"
-          tag="$(jq -r '.tag_name' <<< "$release")"
-          test -n "$tag" && test "$tag" != null
-          curl -fL --retry 3 \
-            "https://github.com/nezhahq/agent/releases/download/$tag/checksums.txt" \
-            -o checksums.txt
-          hash="$(awk '$2 == "nezha-agent_linux_amd64.zip" { print $1; exit }' checksums.txt)"
-          test -n "$hash"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "hash=$hash" >> "$GITHUB_OUTPUT"
+          mkdir -p build-plan
+          if [[ -n "$AGENT_TAG" ]]; then
+            [[ "$AGENT_TAG" =~ ^v[0-9][A-Za-z0-9_.+-]*$ ]]
+            gh api "repos/nezhahq/agent/releases/tags/$AGENT_TAG" > build-plan/agent-release.json
+          else
+            gh api repos/nezhahq/agent/releases/latest > build-plan/agent-release.json
+          fi
+          tag="$(jq -er .tag_name build-plan/agent-release.json)"
+          [[ "$tag" =~ ^v[0-9][A-Za-z0-9_.+-]*$ ]]
+          commit="$(gh api "repos/nezhahq/agent/commits/$tag" --jq .sha)"
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+      - name: Generate the complete package ABI matrix
+        id: matrix
+        env:
+          IPK_VERSION: ${{ inputs.ipk_version || '24.10.5' }}
+          APK_VERSION: ${{ inputs.apk_version || '25.12.4' }}
+          ARCHITECTURES: ${{ inputs.architectures }}
+        run: |
+          python3 scripts/build_matrix.py \
+            --ipk-version "$IPK_VERSION" --apk-version "$APK_VERSION" \
+            --architectures "$ARCHITECTURES" \
+            --agent-release build-plan/agent-release.json --output build-plan/build-plan.json
+      - uses: actions/upload-artifact@v6
+        with:
+          name: build-plan
+          path: build-plan/
+          retention-days: 14
 
-  build:
+  agent:
+    name: Prepare verified Agent binaries
     needs: prepare
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - id: opkg
-            label: 23.05-24.10
-            sdk_url: https://downloads.openwrt.org/releases/24.10.5/targets/x86/64/openwrt-sdk-24.10.5-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.zst
-            sdk_hash: d3e8ea62fc1c12f93a9c808c2ef4c01b6e149ee240bcd5a74d15bebcbc385bdd
-            extension: ipk
-          - id: apk
-            label: 25.12+
-            sdk_url: https://downloads.openwrt.org/releases/25.12.4/targets/x86/64/openwrt-sdk-25.12.4-x86-64_gcc-14.3.0_musl.Linux-x86_64.tar.zst
-            sdk_hash: 28e004c1be4d215d19c1f12a6aa4c8d8f80689549eb707d0ff5a71f16fa8d05f
-            extension: apk
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v8
+        with:
+          name: build-plan
+          path: build-plan
+      - name: Check out pinned Agent source for legacy CPUs
+        if: needs.prepare.outputs.legacy_source == 'true'
+        uses: actions/checkout@v5
+        with:
+          repository: nezhahq/agent
+          ref: ${{ needs.prepare.outputs.agent_commit }}
+          path: agent-source
+          persist-credentials: false
+      - name: Install the Go toolchain required by the pinned Agent
+        if: needs.prepare.outputs.legacy_source == 'true'
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: agent-source/go.mod
+          cache-dependency-path: agent-source/go.sum
+      - name: Verify official binaries and build ARMv5 / soft-float x86
+        env:
+          AGENT_COMMIT: ${{ needs.prepare.outputs.agent_commit }}
+        run: |
+          python3 scripts/prepare_agent.py --plan build-plan/build-plan.json \
+            --source-commit "$AGENT_COMMIT" --source-dir agent-source --output prepared-agent
+      - uses: actions/upload-artifact@v6
+        with:
+          name: prepared-agent
+          path: prepared-agent/
+          compression-level: 0
+          retention-days: 7
 
-      - name: Install build dependencies
+  build:
+    name: ${{ matrix.format }} / ${{ matrix.arch }}
+    needs: [prepare, agent]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 12
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v8
+        with:
+          name: prepared-agent
+          path: prepared-agent
+      - name: Install SDK build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -98,103 +159,66 @@ jobs:
             libyaml-dev libz-dev lld llvm make ninja-build patch pkgconf \
             python3 python3-docutils python3-pip python3-ply python3-pyelftools \
             rsync swig tar unzip wget xmlto xxd zlib1g-dev zstd
-
-      - name: Download and verify SDK
-        run: |
-          set -euo pipefail
-          sdk_url='${{ matrix.sdk_url }}'
-          sdk_hash='${{ matrix.sdk_hash }}'
-          curl -fL --retry 3 "$sdk_url" -o sdk.tar.zst
-          echo "$sdk_hash  sdk.tar.zst" | sha256sum -c -
-          mkdir sdk
-          tar --zstd -xf sdk.tar.zst -C sdk --strip-components=1
-
-      - name: Prepare SDK feeds and package
-        run: |
-          set -euo pipefail
-          cd sdk
-          ./scripts/feeds update base packages luci
-          ./scripts/feeds install -a -p base
-          ./scripts/feeds install -a -p packages
-          ./scripts/feeds install -a -p luci
-          rsync -a --delete \
-            --exclude '.git/' --exclude '.github/' --exclude 'dist/' \
-            --exclude 'sdk/' --exclude 'sdk.tar.zst' --exclude 'upload/' \
-            "$GITHUB_WORKSPACE/" package/luci-app-nezha-agent/
-
-      - name: Configure and compile
+      - name: Compile main and Chinese packages using the matching SDK
         env:
-          NEZHA_AGENT_TAG: ${{ needs.prepare.outputs.agent_tag }}
-          NEZHA_AGENT_HASH: ${{ needs.prepare.outputs.agent_hash }}
+          JOB_JSON: ${{ toJSON(matrix) }}
         run: |
-          set -euo pipefail
-          cd sdk
-          cat > .config <<'EOF'
-          CONFIG_ALL_NONSHARED=n
-          CONFIG_ALL_KMODS=n
-          CONFIG_ALL=n
-          CONFIG_AUTOREMOVE=n
-          CONFIG_PACKAGE_luci-app-nezha-agent=m
-          CONFIG_LUCI_LANG_zh_Hans=y
-          EOF
-          make defconfig
-          make package/luci-app-nezha-agent/{clean,compile} \
-            -j"$(nproc)" V=s \
-            NEZHA_AGENT_TAG="$NEZHA_AGENT_TAG" \
-            NEZHA_AGENT_HASH="$NEZHA_AGENT_HASH"
-
-      - name: Collect packages
-        run: |
-          set -euo pipefail
-          mkdir -p upload
-          find sdk/bin/packages -type f \
-            \( -name 'luci-app-nezha-agent*.${{ matrix.extension }}' \
-               -o -name 'luci-i18n-nezha-agent-zh-cn*.${{ matrix.extension }}' \) \
-            -exec cp -v {} upload/ \;
-          test "$(find upload -type f | wc -l)" -eq 2
-          for file in upload/*; do
-            name="$(basename "$file")"
-            mv "$file" "upload/${{ matrix.label }}_$name"
-          done
-
+          export NEZHA_BUILD_RELEASE="$((GITHUB_RUN_NUMBER + 1))"
+          bash scripts/build_sdk.sh
       - uses: actions/upload-artifact@v6
         with:
           name: packages-${{ matrix.id }}
           path: upload/*
           if-no-files-found: error
+          retention-days: 14
 
   publish:
-    needs: [prepare, build]
-    runs-on: ubuntu-latest
+    name: Verify completeness and publish
+    needs: [prepare, agent, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-
       - uses: actions/download-artifact@v8
         with:
           pattern: packages-*
           path: dist
           merge-multiple: true
-
-      - name: Generate checksums
+      - uses: actions/download-artifact@v8
+        with:
+          name: build-plan
+          path: build-plan
+      - name: Require every planned package and generate checksums
+        env:
+          PACKAGE_VERSION: ${{ needs.prepare.outputs.package_version }}
         run: |
-          cd dist
-          sha256sum * > sha256sums.txt
-
+          python3 scripts/collect_release.py --plan build-plan/build-plan.json --directory dist \
+            --package-version "$PACKAGE_VERSION" --revision "$((GITHUB_RUN_NUMBER + 1))"
       - uses: actions/upload-artifact@v6
         with:
-          name: luci-app-nezha-agent-${{ needs.prepare.outputs.package_version }}
+          name: all-packages-${{ needs.prepare.outputs.package_version }}-${{ github.run_number }}
           path: dist/*
-
-      - name: Generate Chinese release notes
-        if: github.ref_type == 'tag'
+          compression-level: 0
+          retention-days: 30
+      - name: Publish the complete build as a GitHub release
+        if: >-
+          github.event_name != 'pull_request' &&
+          (github.event_name != 'workflow_dispatch' || inputs.publish) &&
+          inputs.architectures == ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AGENT_TAG: ${{ needs.prepare.outputs.agent_tag }}
+          PACKAGE_VERSION: ${{ needs.prepare.outputs.package_version }}
         run: |
-          sh scripts/generate_release_notes.sh "$GITHUB_REF_NAME" release-notes.md
-
-      - name: Create GitHub release
-        if: github.ref_type == 'tag'
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*
-          body_path: release-notes.md
+          set -euo pipefail
+          release_tag="build-${PACKAGE_VERSION}-agent-${AGENT_TAG}-${GITHUB_RUN_NUMBER}"
+          mapfile -d '' files < <(find dist -maxdepth 1 -type f -print0)
+          if gh release view "$release_tag" >/dev/null 2>&1; then
+            gh release upload "$release_tag" "${files[@]}" --clobber
+          else
+            gh release create "$release_tag" "${files[@]}" --target "$GITHUB_SHA" \
+              --title "LuCI ${PACKAGE_VERSION} / Agent ${AGENT_TAG} / 全架构 IPK + APK" \
+              --notes-file dist/release-notes.md --latest
+          fi
