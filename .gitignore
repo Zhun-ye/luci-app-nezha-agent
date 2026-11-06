@@ -3,4 +3,10 @@
 *.tar.gz
 *.tar.zst
 dist/
+__pycache__/
+build-plan/
+prepared-agent/
+agent-source/
+upload/
+sdk/
 .DS_Store
